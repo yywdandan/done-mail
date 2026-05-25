@@ -1,0 +1,17 @@
+.dm-deploy-button {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 999px;
+  color: var(--vp-c-brand-1);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.dm-deploy-button:hover {
+  border-color: var(--vp-c-brand-1);
+  background: var(--vp-c-bg-soft);
+}

@@ -1,0 +1,314 @@
+import { Hono, type Context } from 'hono';
+import { buildFtsQuery } from '../mail-content';
+import { listSafeMailBodies } from '../mail-bodies';
+import { deleteMails } from '../mail';
+import { getMailAttachmentResponse } from '../mail-attachments';
+import { getMailDetailView } from '../mail-share';
+import { getLatestMailRow, listMailRows, mailListSelect, mapMailRow, pushMailFilters, type MailRow } from '../mail-list';
+import { publicFail, publicOk } from '../http/public-response';
+import { encodeCursor, mailPageSize, maxBatchDeleteSize, normalizeSearchKeyword, pageSize, parseBatchIds, parseBooleanQuery, parseCursor } from '../http/query';
+import type { Env } from '../types';
+import { apiOk, jsonFail } from '../utils';
+
+const mailsRoutes = new Hono<{ Bindings: Env }>();
+export const publicMailsRoutes = new Hono<{ Bindings: Env }>();
+type AppContext = Context<{ Bindings: Env }>;
+type PublicMailRow = MailRow & {
+  textBody: string;
+  htmlBody: string;
+  attachments: PublicMailAttachment[];
+};
+interface PublicMailAttachment {
+  id: string;
+  mailId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  contentId: string;
+  disposition: string;
+  stored: boolean;
+}
+interface PublicMailListQuery {
+  perPage: number;
+  cursor?: string;
+  subject?: string;
+  content?: string;
+  domain?: string;
+  to?: string;
+  from?: string;
+  hasAttachments?: boolean | null;
+  includeAttachments?: boolean;
+  waitUntil?: (promise: Promise<unknown>) => void;
+}
+const publicMailListSelect = `mails.id, mails.from_addr AS fromAddr, mails.from_name AS fromName,
+       mails.to_addr AS toAddr, mails.domain, mails.subject, mails.body_preview AS bodyPreview,
+       mails.has_attachments AS hasAttachments, mails.attachment_count AS attachmentCount,
+       mails.raw_size AS rawSize, mails.received_at AS receivedAt, mails.created_at AS createdAt`;
+const publicMailPageSelect = `mails.id, mails.fromAddr, mails.fromName,
+       mails.toAddr, mails.domain, mails.subject, mails.bodyPreview,
+       mails.hasAttachments, mails.attachmentCount,
+       mails.rawSize, mails.receivedAt, mails.createdAt`;
+const publicMailPageOrder = `mails.receivedAt DESC, mails.id DESC`;
+
+function intersectSql(items: string[]) {
+  return items.join('\nINTERSECT\n');
+}
+
+function publicMailMatchSql(subject: string, content: string, params: string[]) {
+  const match: string[] = [];
+  const subjectQuery = subject ? buildFtsQuery(subject, 'subject') : '';
+  const contentQuery = content ? buildFtsQuery(content) : '';
+
+  if (subjectQuery) {
+    match.push(`SELECT mail_id FROM mails_fts WHERE mails_fts MATCH ?`);
+    params.push(subjectQuery);
+  }
+  if (contentQuery) {
+    match.push(`SELECT DISTINCT mail_id FROM mail_content_fts WHERE mail_content_fts MATCH ?`);
+    params.push(contentQuery);
+  }
+
+  return match.length ? intersectSql(match) : '';
+}
+
+function mapPublicMailAttachment(row: Record<string, unknown>): PublicMailAttachment {
+  return {
+    id: String(row.id || ''),
+    mailId: String(row.mailId || ''),
+    filename: String(row.filename || ''),
+    mimeType: String(row.mimeType || ''),
+    size: Number(row.size || 0),
+    contentId: String(row.contentId || ''),
+    disposition: String(row.disposition || ''),
+    stored: Number(row.stored || 0) === 1
+  };
+}
+
+function waitUntilFromContext(c: AppContext) {
+  try {
+    const executionCtx = c.executionCtx;
+    return (promise: Promise<unknown>) => executionCtx.waitUntil(promise);
+  } catch {
+    return undefined;
+  }
+}
+
+async function listPublicMailRows(env: Env, query: PublicMailListQuery) {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  const cursor = parseCursor(query.cursor || '');
+  const subject = normalizeSearchKeyword(query.subject || '');
+  const content = normalizeSearchKeyword(query.content || '');
+  const matchParams: string[] = [];
+  const matchSql = publicMailMatchSql(subject, content, matchParams);
+
+  pushMailFilters(where, params, query);
+  if (cursor) {
+    where.push(`(mails.received_at < ? OR (mails.received_at = ? AND mails.id < ?))`);
+    params.push(cursor.receivedAt, cursor.receivedAt, cursor.id);
+  }
+
+  const limit = query.perPage + 1;
+  const sql = matchSql
+    ? `WITH matched AS (
+         ${matchSql}
+       ),
+       page AS (
+         SELECT ${publicMailListSelect}
+         FROM matched
+         JOIN mails ON mails.id = matched.mail_id
+         ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+         ORDER BY mails.received_at DESC, mails.id DESC
+         LIMIT ?
+       )
+       SELECT ${publicMailPageSelect}
+       FROM page AS mails
+       ORDER BY ${publicMailPageOrder}`
+    : `WITH page AS (
+         SELECT ${publicMailListSelect}
+         FROM mails
+         ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+         ORDER BY mails.received_at DESC, mails.id DESC
+         LIMIT ?
+       )
+       SELECT ${publicMailPageSelect}
+       FROM page AS mails
+       ORDER BY ${publicMailPageOrder}`;
+  const bindParams = matchSql ? [...matchParams, ...params, limit] : [...params, limit];
+  const rows = await env.DB.prepare(sql)
+    .bind(...bindParams)
+    .all<Record<string, unknown>>();
+
+  const rawItems = rows.results || [];
+  const hasMore = rawItems.length > query.perPage;
+  const pageItems = rawItems.slice(0, query.perPage).map((row) => ({
+    ...mapMailRow(row),
+    textBody: '',
+    htmlBody: '',
+    attachments: [] as PublicMailAttachment[]
+  }));
+  if (pageItems.length > 0) {
+    const placeholders = pageItems.map(() => '?').join(', ');
+    const mailIds = pageItems.map((item) => item.id);
+    const bodiesPromise = listSafeMailBodies(env, mailIds, { waitUntil: query.waitUntil });
+    const attachmentRowsPromise = query.includeAttachments
+      ? env.DB.prepare(
+        `SELECT id, mail_id AS mailId, filename, mime_type AS mimeType, size, content_id AS contentId,
+                disposition, stored
+         FROM mail_attachments
+         WHERE mail_id IN (${placeholders})
+         ORDER BY mail_id, created_at ASC, id ASC`
+      )
+        .bind(...mailIds)
+        .all<Record<string, unknown>>()
+      : Promise.resolve({ results: [] as Record<string, unknown>[] });
+    const [bodies, attachmentRows] = await Promise.all([bodiesPromise, attachmentRowsPromise]);
+    const attachmentsByMail = new Map<string, PublicMailAttachment[]>();
+    for (const row of attachmentRows.results || []) {
+      const attachment = mapPublicMailAttachment(row);
+      const current = attachmentsByMail.get(attachment.mailId) || [];
+      current.push(attachment);
+      attachmentsByMail.set(attachment.mailId, current);
+    }
+    pageItems.forEach((item) => {
+      const body = bodies.get(item.id);
+      item.textBody = body?.textBody || '';
+      item.htmlBody = body?.htmlBody || '';
+      item.attachments = attachmentsByMail.get(item.id) || [];
+    });
+  }
+
+  return {
+    items: pageItems,
+    hasMore,
+    nextCursor: hasMore ? encodeCursor(pageItems[pageItems.length - 1]) : ''
+  };
+}
+
+function publicMailFullItem(mail: PublicMailRow, includeAttachments = false) {
+  const item = {
+    id: mail.id,
+    from: mail.fromAddr,
+    fromName: mail.fromName,
+    to: mail.toAddr,
+    toDomain: mail.domain,
+    subject: mail.subject,
+    preview: mail.bodyPreview,
+    text: mail.textBody,
+    html: mail.htmlBody,
+    hasAttachments: mail.hasAttachments,
+    attachmentCount: mail.attachmentCount,
+    size: mail.rawSize,
+    receivedAt: mail.receivedAt
+  };
+  if (!includeAttachments) return item;
+  return {
+    ...item,
+    attachments: mail.attachments.map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      contentId: attachment.contentId,
+      disposition: attachment.disposition,
+      stored: attachment.stored
+    }))
+  };
+}
+
+async function listPublicMails(c: AppContext) {
+  const perPage = pageSize(c.req.query('limit'), 20, 1, 50);
+  const from = (c.req.query('from') || '').trim().toLowerCase();
+  const to = (c.req.query('to') || '').trim().toLowerCase();
+  const toDomain = (c.req.query('toDomain') || '').trim().toLowerCase();
+  const subject = normalizeSearchKeyword(c.req.query('subject') || '');
+  const content = normalizeSearchKeyword(c.req.query('content') || '');
+  let hasAttachments: boolean | null;
+  let includeAttachments: boolean;
+  try {
+    hasAttachments = parseBooleanQuery(c.req.query('hasAttachments'), 'hasAttachments');
+    includeAttachments = parseBooleanQuery(c.req.query('includeAttachments'), 'includeAttachments') === true;
+  } catch (error) {
+    return publicFail(c, error instanceof Error ? error.message : '布尔参数格式错误', 400, 'invalid_boolean');
+  }
+  const page = await listPublicMailRows(c.env, {
+    perPage,
+    cursor: (c.req.query('cursor') || '').trim(),
+    subject,
+    content,
+    from,
+    to,
+    domain: toDomain,
+    hasAttachments,
+    includeAttachments,
+    waitUntil: waitUntilFromContext(c)
+  });
+
+  return publicOk(c, page.items.map((item) => publicMailFullItem(item, includeAttachments)), {
+    limit: perPage,
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore
+  });
+}
+
+async function listMails(c: AppContext) {
+  const perPage = mailPageSize(c.req.query('per_page') || c.req.query('pageSize'));
+  const cursor = (c.req.query('cursor') || '').trim();
+  const keyword = normalizeSearchKeyword(c.req.query('keyword') || '');
+  const domain = (c.req.query('domain') || '').trim();
+  const to = (c.req.query('to') || '').trim();
+  const page = await listMailRows(c.env, { perPage, cursor, keyword, domain, to });
+
+  return apiOk(c, page.items, {
+    per_page: perPage,
+    next_cursor: page.nextCursor,
+    has_more: page.hasMore
+  });
+}
+
+async function getLatestMail(c: AppContext) {
+  return apiOk(c, await getLatestMailRow(c.env));
+}
+
+async function getMailDetail(c: AppContext) {
+  const mail = await getMailDetailView(c.env, c.req.param('id') || '', {
+    waitUntil: waitUntilFromContext(c)
+  });
+  return mail ? apiOk(c, mail) : jsonFail(c, '邮件不存在', 404);
+}
+
+async function downloadMailAttachment(c: AppContext) {
+  if (!c.env.MAIL_BUCKET) return jsonFail(c, '未启用附件保存', 404, 'attachment_storage_disabled');
+  return (await getMailAttachmentResponse(c.env, c.req.param('id') || '', c.req.param('attachmentId') || '', c.env.MAIL_BUCKET)) || jsonFail(c, '附件不存在或未保存内容', 404, 'attachment_not_found');
+}
+
+async function downloadPublicMailAttachment(c: AppContext) {
+  if (!c.env.MAIL_BUCKET) return publicFail(c, '未启用附件保存', 404, 'attachment_storage_disabled');
+  return (await getMailAttachmentResponse(c.env, c.req.param('id') || '', c.req.param('attachmentId') || '', c.env.MAIL_BUCKET)) || publicFail(c, '附件不存在或未保存内容', 404, 'attachment_not_found');
+}
+
+mailsRoutes.get('/', listMails);
+
+mailsRoutes.post('/batch-delete', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const ids = parseBatchIds(body);
+
+  if (ids.length === 0) return jsonFail(c, '请选择要删除的邮件', 400);
+  if (ids.length > maxBatchDeleteSize) return jsonFail(c, `单次最多删除 ${maxBatchDeleteSize} 封邮件`, 400, 'batch_too_large');
+
+  return apiOk(c, { ids, deleted: await deleteMails(c.env, ids) });
+});
+
+mailsRoutes.delete('/:id', async (c) => {
+  const id = c.req.param('id');
+  return apiOk(c, { id, deleted: await deleteMails(c.env, [id]) });
+});
+
+mailsRoutes.get('/latest', getLatestMail);
+mailsRoutes.get('/:id', getMailDetail);
+mailsRoutes.get('/:id/attachments/:attachmentId', downloadMailAttachment);
+
+publicMailsRoutes.get('/', listPublicMails);
+publicMailsRoutes.get('/:id/attachments/:attachmentId', downloadPublicMailAttachment);
+
+export default mailsRoutes;
